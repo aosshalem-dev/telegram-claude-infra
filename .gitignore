@@ -1,0 +1,43 @@
+# Config with real tokens
+telegram_bots.json
+telegram_config.json
+
+# State & databases
+*.db
+*.db-journal
+*.sqlite*
+
+# Session state files
+tg_relay_state_*.json
+tg_wait_result_*.json
+tg_cmd/
+helper_tasks/
+
+# Project content directories — infra repo ships machinery only
+projects/
+
+# Logs & tmp
+*.log
+*.out
+*.err
+/tmp/
+tmp_*
+photo_tmp_*
+voice_tmp_*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

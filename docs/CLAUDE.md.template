@@ -1,0 +1,70 @@
+# Telegram Bot Relay — Session Protocol
+
+This is the GENERIC relay protocol for bots that run on this infrastructure. Copy this file to `~/CLAUDE.md` (or per-project `CLAUDE.md`) and adjust paths/project list to your setup.
+
+If the user's FIRST message starts with `@` — it is a Telegram bot command. Execute immediately.
+
+## Startup (steps run sequentially)
+1. Read `<REPO_ROOT>/telegram_bots.json`
+2. Match `short` field first, then `username` (case-insensitive)
+3. Note bot key and `project` field
+4. Read project CLAUDE.md: `<REPO_ROOT>/projects/<project>/CLAUDE.md`
+5. Read insights: `python3 <REPO_ROOT>/bin/read_insights.py --project <project> --last 20`
+6. Read TODOs: `python3 <REPO_ROOT>/bin/write_todo.py --project <project> list`
+7. Check CURRENT_TASK.md: `projects/<project>/CURRENT_TASK.md` — if exists, resume that work
+8. Check messages: `python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> check`
+9. Git baseline commit (before any work): `git add projects/<project>/ && git commit -m "[@<bot> session start] <reflective title>"`
+10. Send connected message: `python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> reply "Connected [HH:MM:SS]. Project: <project>. <N> pending. Listening."`
+11. Start session_wait (run_in_background): `python3 <REPO_ROOT>/bin/tg_session_wait.py --bot <key> --session <key>_<YYYYMMDD> --new-session`
+
+## Session Loop (when session_wait exits)
+Read the task output, handle by type:
+- **"keepalive"**: Write heartbeat, do idle work (TODOs, insights), restart session_wait
+- **"consolidate"** (idle shutdown): Write insights/TODOs, git commit, save context, send summary, stop
+- **"AUTO_EXPIRE"**: Save context, write insights/TODOs, send goodbye, stop — poller auto-relaunches
+- **Otherwise**: Check messages, process, reply, restart session_wait
+
+## Processing Messages
+- Every reply MUST include `[HH:MM:SS | Ns]` prefix (current time + seconds since message received)
+- Quick answer: `python3 .../tg_relay.py --bot <key> reply "[HH:MM:SS | Ns] text"`
+- Heavy work: send `"Working on it — <description>"` first, then do work, then reply with result
+- Multi-step: use `python3 .../tg_relay.py --bot <key> progress "Step 1/3: <what>"` between steps
+- **Write-ahead context before non-trivial work** — if session dies mid-task, replacement needs to know what to continue
+
+## Commands Reference
+```bash
+# Messages
+python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> check                    # read unread
+python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> reply "text"              # reply to user
+python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> progress "text"           # throttled progress update
+python3 <REPO_ROOT>/bin/tg_relay.py --bot <key> send <target_bot> "text"  # inter-bot message
+
+# Insights & TODOs
+python3 <REPO_ROOT>/bin/write_insight.py --project <p> --type <gotcha|pattern|fix|preference|warning|tip> --text "x" --bot <key>
+python3 <REPO_ROOT>/bin/write_todo.py --project <p> add --text "x" --priority <high|medium|low> --bot <key>
+python3 <REPO_ROOT>/bin/write_todo.py --project <p> done --id <N>
+```
+
+## Save Context (mandatory before expiry or heavy work)
+```python
+import sys, os; sys.path.insert(0, os.path.expanduser('<REPO_ROOT>/bin'))
+from tg_session_context import save_context
+save_context('<bot_key>', {
+    'current_task': 'what you are working on',
+    'status': 'idle_listening / in_progress / expiring',
+    'resume_instructions': 'Concrete: what the NEXT session should do immediately',
+    'artifacts': ['files modified'], 'pending': ['things left to do'],
+})
+```
+
+## Key Rules
+- NEVER poll with `tg_relay.py check` in a loop — use session_wait
+- NEVER use Telethon or pip packages — relay uses only stdlib (urllib)
+- After context compaction: if not waiting on background task, restart session_wait immediately
+- Backup before bulk DB operations
+- No irreversible external actions without per-item confirmation
+
+## Notes
+- `<REPO_ROOT>` refers to this infrastructure repo's root on your machine (e.g. `~/telegram-claude-infra`)
+- Per-project CLAUDE.md can override/extend these rules; startup reads project CLAUDE.md after this one
+- The `bot_creator` project includes a flow to register new bots from BotFather output — see `projects/bot_creator/CLAUDE.md`

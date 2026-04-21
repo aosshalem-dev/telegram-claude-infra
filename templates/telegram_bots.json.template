@@ -1,0 +1,39 @@
+{
+  "bots": {
+    "example_bot": {
+      "token": "YOUR_BOT_TOKEN_FROM_BOTFATHER",
+      "name": "Example Bot",
+      "username": "example_bot_username",
+      "short": "@ex",
+      "description": "Example project — edit this",
+      "project": "example_project",
+      "chat_id": 123456789,
+      "auto_launch": true,
+      "allowed_user_ids": [123456789],
+      "user_aliases": {
+        "you": 123456789
+      }
+    },
+    "bot_creator": {
+      "token": "YOUR_BOT_CREATOR_TOKEN",
+      "name": "Bot Creator",
+      "username": "bot_creator_username",
+      "short": "@d",
+      "description": "Meta-bot: creates new bots + projects from BotFather output",
+      "project": "bot_creator",
+      "chat_id": 123456789,
+      "auto_launch": true,
+      "allowed_user_ids": [123456789]
+    }
+  },
+  "allowed_user_ids": [123456789],
+  "daemon": {
+    "global_restart_hours": 24,
+    "default_model": "sonnet",
+    "enabled_bots": ["example_bot", "bot_creator"],
+    "default_timeout_sec": 300,
+    "approval_timeout_sec": 86400,
+    "history_limit": 20,
+    "poll_interval_sec": 3
+  }
+}
