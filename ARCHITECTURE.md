@@ -319,9 +319,129 @@ The repo ships docs and templates. The `bin/` and `projects/` and `telegram_bots
 
 ---
 
+## Multi-machine deployments (proposed pattern, untested)
+
+> **STATUS: Untested.** This section is a design — it has not been deployed in production. Treat as a starting point, not a recipe. If you build it, contributing fixes / corrections back to PITFALLS.md is welcome.
+
+The base design is single-machine. If you have bots running on more than one host (e.g., a Mac for some projects + a PC or Linux box for others) and want them to coordinate, the recommended pattern is:
+
+- **Real-time inter-bot messages → Telegram.** Small text, instant. The transport you already have.
+- **Heavy artifacts → private GitHub repo.** Files larger than ~4KB, multi-MB reports, anything you want versioned. Sender pushes, receiver pulls when ready. Latency is acceptable because artifacts are not on the latency-critical path.
+- **No SSH, no Tailscale, no inbound ports.** Both machines only need outbound HTTPS to Telegram and GitHub. Works behind NAT, no firewall changes.
+
+### How an inter-bot Telegram message goes cross-machine
+
+Each Telegram bot is identified by its token. Tokens are normally machine-local. To enable cross-machine sending, **share the relevant bot tokens across both machines** — specifically, machine 1 must hold the tokens of every bot it might want to send to (even if the actual polling of those bots happens on machine 2).
+
+Sending flow:
+
+```
+machine 1, bot A's session decides to send a task to bot B
+  │
+  ▼
+tg_relay.py send <bot_B> "[from @A] please handle X"
+  │   (bot B is in machine 1's telegram_bots.json with its token,
+  │    even though machine 1 doesn't poll bot B)
+  ▼
+Telegram API:  POST /bot<TOKEN_OF_B>/sendMessage
+                chat_id=<B's user-chat>
+                text="[from @A] please handle X"
+  │
+  ▼
+machine 2's poller, on its next getUpdates for bot B,
+sees the new message with sender = the bot account
+  │
+  ▼
+machine 2 wakes bot B's tmux session, B reads the message,
+sees "[from @A]" prefix, treats as inter-bot directive
+  │
+  ▼
+B replies via tg_relay.py reply (sent to user-chat of B)
+  │
+  ▼
+machine 1's poller is also subscribed to that chat (if it polls A
+in the same chat) — OR — B sends a reciprocal inter-bot message
+to A using bot A's token (which machine 2 also holds).
+```
+
+Two important details:
+
+1. **Both machines must share the user's chat_id** — usually the human owner is the same, so this is just "your Telegram user ID, hardcoded once".
+2. **`getUpdates` is exclusive per token.** Only one machine at a time can call `getUpdates` on a given bot token (the second one steals updates from the first). So even though both machines have the token, only one *polls* with it; the other only *sends* with it.
+
+### How heavy artifacts move
+
+For anything larger than a one-line task, attach it via a private GitHub repo:
+
+1. Bot A on machine 1 writes the artifact to a working tree of a private repo (e.g., `~/handoff-bus/artifacts/<uuid>/report.md`).
+2. `git add . && git commit -m "artifact <uuid> from A→B" && git push`.
+3. A sends an inter-bot Telegram message to B with just the reference: `"[from @A] artifact ready: <uuid>, see commit <hash>"`.
+4. B receives, runs `git pull`, reads `~/handoff-bus/artifacts/<uuid>/report.md`, processes.
+5. B writes `~/handoff-bus/acks/<uuid>.json`, pushes, sends Telegram `"[from @B] ack <uuid> done"`.
+
+A few rules:
+
+- The handoff repo is **private**. Use a fine-grained PAT or deploy key per machine.
+- Squash or expire artifacts periodically. The repo will grow.
+- Don't put secrets in artifacts (they're in git history forever). If you must, use git-crypt or age-encrypted blobs.
+- For files >50MB, use Git LFS or skip git entirely (e.g., upload to a private S3-like store, send a presigned URL via Telegram).
+
+### Code skeleton
+
+In `tg_relay.py send`, when the target bot's config has `multi_machine: true`:
+
+```python
+def send_cross_machine(target_bot_cfg: dict, sender_bot_key: str, text: str):
+    """Send an inter-bot message to a bot on another machine.
+    Uses the target bot's Telegram token directly; the target's poller
+    (on the other machine) sees the message via getUpdates."""
+    if not text.startswith(f"[from @"):
+        text = f"[from @{sender_bot_key}] {text}"
+    token = target_bot_cfg["token"]
+    chat_id = target_bot_cfg["chat_id"]  # hardcoded user chat for the owner
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({"chat_id": chat_id, "text": text}).encode()
+    req = urllib.request.Request(url, data=payload,
+                                  headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+    # NOTE: do NOT also write to local messages.db — the receiving machine
+    # will pick this up via its own getUpdates and write its own row.
+```
+
+Heavy artifact helper:
+
+```python
+def push_artifact(uuid: str, content: bytes, filename: str, repo_dir: Path) -> str:
+    """Drop the artifact in the handoff repo and push. Returns commit hash."""
+    target = repo_dir / "artifacts" / uuid / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", f"artifact {uuid}"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "push"], cwd=repo_dir, check=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir,
+                          capture_output=True, text=True).stdout.strip()
+```
+
+### Pitfalls specific to this pattern (also untested — add real ones as you find them)
+
+- **Token leak from machine 1 = compromise of bot B.** Mitigate: each machine's token store is encrypted at rest; rotate tokens on machine loss.
+- **Race on `getUpdates`.** If by mistake both machines poll the same bot token, they will alternate stealing updates and both will appear unreliable. Enforce "one poller per token" in your config validation.
+- **Telegram rate limits cross-bot.** A token can sendMessage at ~30 msg/sec globally and 1 msg/sec per chat. Multi-machine doesn't multiply this — both machines using the same token share the budget. For burst traffic, use the GitHub artifact path.
+- **GitHub PAT scope.** The handoff PAT should be scoped to one repo, not user-wide. If it leaks, the blast radius is the handoff repo only.
+- **Heartbeat / liveness.** With cross-machine, "is the other side alive" becomes a real question. Recommend a periodic inter-bot heartbeat (every 10 min, "@A → @B: alive?") and an alert if no reply within 2 cycles.
+
+### When this pattern is the wrong choice
+
+- If you can install Tailscale, that's still simpler — the entire mesh is encrypted, no token sharing, no GitHub dependency. Use this Telegram+GitHub pattern when SSH/Tailscale is unavailable or undesired (e.g., security policy, locked-down corp machine).
+- If real-time isn't needed and everything can be batch, skip Telegram for inter-bot entirely and use only the GitHub queue. Simpler, fewer moving parts.
+- If you have >2 machines, the token-sharing matrix gets unwieldy fast. Consider a coordinator bot polled by all machines (pattern (b) from the design discussion), at the cost of one indirection per message.
+
+---
+
 ## What this design is NOT
 
-- **Not multi-machine.** All bots and the poller live on one host. The shared SQLite file enforces this.
+- **Not multi-machine** *by default*. All bots and the poller live on one host. The shared SQLite file enforces this. See "Multi-machine deployments" above for the proposed extension (untested).
 - **Not a chat UI.** Telegram is the UI. We don't render anything ourselves.
 - **Not auth-managed.** Telegram allowed_user_ids gate ACL. There is no OAuth flow, no signup, no rate limiting beyond what Telegram provides.
 - **Not multi-tenant.** Built for one human controlling many of their own projects.

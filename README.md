@@ -2,7 +2,7 @@
 
 **Goal: easy connection to Claude Code sessions via Telegram bots.** One bot per project. One tap on your phone wakes a tmux-backed Claude session that has full project context — answers, edits files, runs commands, replies in chat, goes back to sleep.
 
-Bots can also **message each other** on the same machine for coordination, status tracking, and handing off work — and share files trivially via the local filesystem. Cross-machine inter-bot messaging works too over Tailscale + SSH (see ARCHITECTURE.md → Multi-machine).
+Bots can also **message each other** on the same machine for coordination, status tracking, and handing off work — and share files trivially via the local filesystem. A **cross-machine extension** is sketched in ARCHITECTURE.md (Telegram for instant inter-bot messages + private GitHub repo for heavy artifacts) but it's **untested**; treat it as a starting point for your own deployment.
 
 > **This repo is intentionally documentation-first.** It does not ship a runnable implementation. It ships everything you need for your AI assistant to **build** the implementation correctly: the architecture, the failure modes, the small annotated code excerpts that are easy to get wrong.
 >
