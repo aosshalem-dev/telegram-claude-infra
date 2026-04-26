@@ -1,229 +1,96 @@
 # telegram-claude-infra
 
-Telegram ↔ Claude Code bridge. Lets a user control multiple Claude Code sessions through Telegram bots: each bot = one project, each message wakes a dedicated tmux-backed Claude session, and Claude replies back to the user in-chat.
+A pattern for letting one human control many parallel Claude Code sessions through Telegram bots. Each bot = one project. Each message wakes a dedicated tmux-backed Claude session, which replies in-chat and goes back to sleep.
 
-Pure Python stdlib (no external pip packages). SQLite for message history. tmux for session persistence.
-
-## What this repo contains
-Just the **machinery** — no project content, no bot tokens, no conversation data. Setting up your own instance requires:
-1. A machine that stays on (macOS/Linux; Windows unsupported).
-2. Python 3.9+, `tmux`, `sqlite3` (all standard).
-3. [Claude Code](https://docs.claude.com/claude-code) installed and logged in.
-4. At least one Telegram bot token from [@BotFather](https://t.me/BotFather).
-
-## Architecture
-
-```
-┌──────────────┐                   ┌──────────────────────────────────┐
-│  Telegram    │◄──getUpdates───── │  tg_master_poller.py (daemon)    │
-│  user        │                   │   • polls all bots every 3s      │
-│              │                   │   • logs messages to SQLite      │
-│              │                   │   • spawns/kills tmux per bot    │
-└──────────────┘                   │   • force-restarts dead sessions │
-       ▲                           └────────────┬─────────────────────┘
-       │                                        │ spawns
-       │                                        ▼
-       │                           ┌──────────────────────────────────┐
-       │                           │  tmux: tg_<bot_key>              │
-       │                           │  └─ Claude Code session          │
-       │                           │       │                          │
-       └─────sendMessage───────────┤       │ calls:                   │
-           (via tg_relay.py)       │       │                          │
-                                   │       ▼                          │
-                                   │  bin/tg_session_wait.py          │
-                                   │   • waits for new messages       │
-                                   │   • returns to Claude on arrival │
-                                   │                                  │
-                                   │  bin/tg_relay.py                 │
-                                   │   • sends replies/progress       │
-                                   │   • inter-bot messages           │
-                                   │   • photo/voice download         │
-                                   └──────────────────────────────────┘
-```
-
-**Core loop per bot:**
-1. Poller sees new Telegram message → writes row to `tg_messages.db` → wakes or spawns tmux session.
-2. Claude starts in the tmux pane with an `@<bot>` command, reads bot config, starts `tg_session_wait.py` in background.
-3. `tg_session_wait.py` exits when (a) a new message arrives, (b) idle keepalive fires, or (c) consolidate/expire fires.
-4. Claude processes the message, replies via `tg_relay.py`, restarts `tg_session_wait.py`, loops.
-
-## Directory layout (recommended)
-
-```
-~/telegram-claude-infra/        # root of this repo on the deploying machine
-├── bin/                        # infrastructure scripts (shipped here)
-│   ├── tg_master_poller.py     # the daemon
-│   ├── tg_relay.py             # message I/O
-│   ├── tg_session_wait.py      # blocking wait for new messages
-│   ├── tg_session_state.py     # session state & heartbeat
-│   ├── tg_session_context.py   # save_context / load_context
-│   ├── tg_relay_utils.py       # shared helpers
-│   ├── tg_approval_gate.py     # optional approval gating
-│   ├── read_insights.py        # read project insights
-│   ├── write_insight.py        # append to project insights.jsonl
-│   ├── write_todo.py           # per-project TODO list (SQLite)
-│   ├── write_suggestion.py     # user-approved suggestions
-│   └── send_reminder.py        # scheduled reminder helper
-├── docs/
-│   └── CLAUDE.md.template      # generic relay protocol (copy to ~/CLAUDE.md)
-├── templates/
-│   ├── telegram_bots.json.template  # bot registry template
-│   └── bot_creator_CLAUDE.md   # the bot-creation flow
-├── telegram_bots.json          # YOUR bot registry (not committed — .gitignored)
-├── tg_messages.db              # SQLite message history (not committed)
-└── projects/                   # YOUR project folders (not committed)
-    ├── bot_creator/            # the meta-bot that registers new bots
-    │   └── CLAUDE.md
-    └── <your_project>/
-        ├── CLAUDE.md
-        ├── insights.jsonl
-        └── CURRENT_TASK.md     # optional: resumable task state
-```
-
-## Setup — quick start
-
-### 1. Clone
-```bash
-git clone https://github.com/<you>/telegram-claude-infra.git ~/telegram-claude-infra
-cd ~/telegram-claude-infra
-```
-
-### 2. Dependencies
-```bash
-# macOS
-brew install tmux sqlite3
-# Linux (Debian/Ubuntu)
-sudo apt install tmux sqlite3 python3
-```
-Install Claude Code CLI separately (see Anthropic docs).
-
-### 3. Create your first bot
-In Telegram, message `@BotFather`:
-```
-/newbot
-→ pick name, pick username ending in "bot"
-→ BotFather gives you a token
-```
-Find your Telegram user ID by messaging `@userinfobot`.
-
-### 4. Configure
-Copy the template and fill in real values:
-```bash
-cp templates/telegram_bots.json.template telegram_bots.json
-# Edit telegram_bots.json:
-#   - replace YOUR_BOT_TOKEN with BotFather token
-#   - replace 123456789 with your Telegram user ID
-#   - set project folder name
-```
-
-### 5. Create project folder + protocol
-```bash
-mkdir -p projects/<your_project>
-touch projects/<your_project>/CLAUDE.md projects/<your_project>/insights.jsonl
-# Copy the generic relay protocol to your home:
-cp docs/CLAUDE.md.template ~/CLAUDE.md
-# Edit ~/CLAUDE.md: replace <REPO_ROOT> with ~/telegram-claude-infra
-```
-
-### 6. Start the poller
-```bash
-nohup python3 bin/tg_master_poller.py > /tmp/poller.out 2> /tmp/poller.err &
-```
-For always-on: wrap in `launchd` (macOS) or `systemd` service (Linux). Sample `launchd` plist in Appendix A.
-
-### 7. Send a message
-Open the bot in Telegram and send any text. The poller will:
-1. Log the message in `tg_messages.db`.
-2. Spawn a tmux session named `tg_<your_bot_key>` running Claude Code.
-3. Claude reads the message, replies via `tg_relay.py`.
-
-### 8. Watch a session
-```bash
-tmux attach -t tg_<bot_key>      # read-only: add -r flag
-tmux ls                          # list all sessions
-```
-
-## Registering more bots (the `bot_creator` flow)
-Register `bot_creator` as one of your bots first. Then in the bot_creator Telegram chat, paste any BotFather output and say "create project called X" — the Claude session running there will parse it, create `projects/X/`, register the bot, and tell you it's ready. See `templates/bot_creator_CLAUDE.md` for the full protocol.
-
-## Admin visibility
-Every message (incoming, outgoing, inter-bot) is logged to `tg_messages.db`. Useful queries:
-```bash
-# Last 50 messages across all bots
-sqlite3 tg_messages.db "SELECT bot, direction, sender, substr(text,1,80), msg_time FROM messages ORDER BY id DESC LIMIT 50"
-
-# Activity for one bot
-sqlite3 tg_messages.db "SELECT direction, substr(text,1,80), msg_time FROM messages WHERE bot='<bot_key>' ORDER BY id DESC LIMIT 20"
-
-# Session starts/stops
-sqlite3 tg_messages.db "SELECT bot, session_type, started_at, heartbeat FROM sessions ORDER BY id DESC LIMIT 20"
-```
-
-In addition, every bot writes its insights/TODOs to `projects/<project>/insights.jsonl` and the TODO SQLite — so you can grep them for a rolling activity log per project.
-
-## Hardcoded paths — spots to review
-A few helper behaviors assume specific deployment shapes. Before running, review:
-- `bin/tg_master_poller.py` line ~1657–1659 (`MAC_DIR`, `MAC_CLAUDE`, `MAC_PATH`) — adjust to your Claude binary location and shell PATH.
-- `bin/tg_relay.py` SSH blocks (`USER@HOST` placeholders) — these are optional cross-machine relay features; leave as-is if not using, or replace with your own SSH target.
-- `bin/tg_session_state.py` (`MAC_HOST`) — same as above.
-
-Everything else uses `Path(__file__).parent` for script-relative resolution — no edits needed if you keep the `bin/` folder structure.
-
-## Key design choices
-- **No pip dependencies.** Only stdlib. This reduces supply-chain risk and makes setup trivial.
-- **SQLite for message history.** One `tg_messages.db` holds all history; cross-bot queries are easy.
-- **tmux for sessions.** Each bot runs Claude Code inside `tmux tg_<bot_key>`, so sessions survive the poller restarting and can be attached for debugging.
-- **Inter-bot messaging.** `tg_relay.py send <target_bot> "msg"` writes to the target's inbox — enables multi-bot workflows (manager bot coordinating worker bots).
-- **Session protocol in `CLAUDE.md`.** The behavior Claude follows (startup, session_wait loop, reply formatting) is in the user-level CLAUDE.md. The Python scripts are just plumbing — the "brain" is the protocol text Claude reads.
-
-## Limitations
-- macOS / Linux only (tmux required).
-- Single-machine: no multi-host bot distribution. All bots run on one daemon.
-- No web UI. Admin is via CLI + SQLite queries + `tmux attach`.
-- Claude Code authentication (login) is handled outside this repo.
-
-## License
-Released under MIT. No warranty. No official support.
+> **This repo is intentionally documentation-first.** It does not ship a runnable implementation. It ships everything you need for your AI assistant to **build** the implementation correctly: the architecture, the failure modes, the small annotated code excerpts that are easy to get wrong.
+>
+> If you want a tutorial-style "clone-and-run" repo, this isn't it. If you want to deploy a Telegram-Claude bridge that survives months of production weirdness, read on.
 
 ---
 
-## Appendix A — launchd sample (macOS)
-`~/Library/LaunchAgents/com.telegram-claude-infra.poller.plist`:
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.telegram-claude-infra.poller</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/YOU/telegram-claude-infra/bin/tg_master_poller.py</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/tg_poller.out</string>
-  <key>StandardErrorPath</key><string>/tmp/tg_poller.err</string>
-</dict>
-</plist>
+## Why no code?
+
+The architecture (poller + per-bot tmux + SQLite + a CLI relay) is conceptually simple. Re-implementing it from `ARCHITECTURE.md` will get you a working v1 in a weekend. The value an outsider can't easily reproduce is the **set of failure modes you'll hit in production** — zombie tmux sessions, monorepo git races, keychain corruption masquerading as silence, ack-drift across inter-bot bursts, "alive but deaf" Claude processes. Those live in `PITFALLS.md`.
+
+Shipping the original implementation tempts the receiving AI to refactor away the fixes (they look like cruft until you know what they're protecting against). Shipping the description + the bug memorial transfers what's actually expensive: the lessons.
+
+---
+
+## What's in this repo
+
+| File | What it gives you |
+|---|---|
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | The system: 4 components, contracts, DB schema, message round-trip, lifecycle events, config schema. Read first. |
+| **[PITFALLS.md](PITFALLS.md)** | 17 failure modes from production. Each entry: symptom / root cause / fix / why it's easy to miss. **The most valuable file in the repo.** |
+| **[SNIPPETS.md](SNIPPETS.md)** | 8 small annotated code excerpts for the trickier bits (zombie detection, batch-ack, fcntl lock, keychain validation). Use as sanity checks on your implementation. |
+| **[docs/CLAUDE.md.template](docs/CLAUDE.md.template)** | The relay protocol — the markdown file each Claude session reads on startup. Defines what Claude does for each event (new message, keepalive, consolidate, expire). The "brain" lives here, not in the Python. |
+| **[templates/telegram_bots.json.template](templates/telegram_bots.json.template)** | Bot registry schema — every config option for every bot. |
+| **[templates/bot_creator_CLAUDE.md](templates/bot_creator_CLAUDE.md)** | The meta-bot pattern: register a "bot_creator" bot once, then register all future bots by messaging it a BotFather token. |
+
+---
+
+## Recommended reading order
+
+1. **README.md** (this file) — orientation. ~5 min.
+2. **[ARCHITECTURE.md](ARCHITECTURE.md)** — what you're building. ~15 min.
+3. **[PITFALLS.md](PITFALLS.md)** — what will break. ~25 min, but worth re-reading after your v1 to make sure you've covered them.
+4. **[SNIPPETS.md](SNIPPETS.md)** — code-level sanity checks. ~10 min, mostly skim.
+5. **[docs/CLAUDE.md.template](docs/CLAUDE.md.template)** — the protocol your sessions follow. Adapt this for your conventions.
+6. **[templates/](templates/)** — config and bot-creation flow.
+
+---
+
+## What you need to provide
+
+This repo describes the system; you implement it. You'll need:
+
+- **A machine that stays on.** macOS or Linux. Not Windows (tmux-dependent).
+- **Python 3.9+.** Stdlib only — no pip dependencies. (See PITFALL #11 for why.)
+- **`tmux` and `sqlite3`.** Standard.
+- **[Claude Code](https://docs.claude.com/claude-code) installed and logged in.** The whole system runs Claude Code subprocesses; whatever quota and account you log in with is what they use.
+- **At least one Telegram bot token** from [@BotFather](https://t.me/BotFather). One per project once you scale up.
+- **An always-on supervisor** for your poller daemon — `launchd` on macOS, `systemd` on Linux. The poller is a single point of failure; auto-restart it.
+
+---
+
+## High-level architecture
+
 ```
-Load: `launchctl load ~/Library/LaunchAgents/com.telegram-claude-infra.poller.plist`
-
-## Appendix B — systemd sample (Linux)
-`/etc/systemd/system/tg-poller.service`:
-```ini
-[Unit]
-Description=Telegram↔Claude poller
-After=network.target
-
-[Service]
-Type=simple
-User=YOU
-WorkingDirectory=/home/YOU/telegram-claude-infra
-ExecStart=/usr/bin/python3 /home/YOU/telegram-claude-infra/bin/tg_master_poller.py
-Restart=always
-
-[Install]
-WantedBy=default.target
+Telegram cloud ──► poller (one daemon for all bots) ──► tmux per bot ──► Claude Code
+                          │                                  │
+                          └─ writes ──► SQLite (messages.db) ◄┘ reads
+                                              │
+                                              └─ tg_relay.py reply ──► Telegram cloud ──► user
 ```
-Enable: `sudo systemctl enable --now tg-poller`
+
+Full diagrams + contracts in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+## How to use this repo with your AI assistant
+
+Suggested workflow:
+
+1. Fork this repo (or just clone it as starter docs).
+2. Tell your AI assistant: "Implement the system described in `ARCHITECTURE.md`. Then walk through every entry in `PITFALLS.md` and confirm whether your implementation handles it. For the entries you don't explicitly handle, explain why they're not relevant *or* add the fix. Finally, compare your code against `SNIPPETS.md` to catch shape-level issues."
+3. After v1 boots, re-read `PITFALLS.md` once more and challenge the AI on any glossed-over items.
+4. Add your own bot configs in `telegram_bots.json` (start from `templates/telegram_bots.json.template`).
+5. Adapt `docs/CLAUDE.md.template` to your conventions, copy to `~/CLAUDE.md`.
+6. Create `projects/<your_project>/CLAUDE.md` for each project.
+7. Start the poller. Send a message. Iterate.
+
+---
+
+## License
+
+MIT. No warranty. No support.
+
+If you ship something based on this, attribution is welcome but not required. PRs to improve PITFALLS.md (new failure modes you discover) are very welcome — that file should grow over time.
+
+---
+
+## What this repo used to be
+
+Until April 2026 this repo shipped the actual `bin/*.py` implementation (~7,600 lines) directly. Experience with handoffs taught us that the code without the bug memorial is misleading: receiving AIs refactored away the very fixes that made it production-stable. The current shape — description + warnings + small annotated excerpts — transfers more usefully.
+
+If you want to see the original implementation as a reference, check out the git history before the 2026-04-26 commit that introduced this layout.
